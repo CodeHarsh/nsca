@@ -82,7 +82,7 @@ nsca_group=@nsca_grp@
 # messages are logged to the syslog facility. 
 # Values: 0 = debugging off, 1 = debugging on
 
-debug=0
+debug=1
 
 
 
@@ -201,3 +201,4 @@ max_packet_age=30
 
 decryption_method=1
 
+rest_url=http://10.0.2.2:8888/fk-alert-service/nsca

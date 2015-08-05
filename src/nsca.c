@@ -22,6 +22,12 @@
 #include "../include/utils.h"
 #include "../include/nsca.h"
 
+/* json-c (https://github.com/json-c/json-c) */
+#include <json-c/json.h>
+
+/* libcurl (http://curl.haxx.se/libcurl/c) */
+#include <curl/curl.h>
+
 
 static int server_port=DEFAULT_SERVER_PORT;
 static char server_address[16]="0.0.0.0";
@@ -46,6 +52,7 @@ char    *nsca_group=NULL;
 char    *nsca_chroot=NULL;
 char    *check_result_path=NULL;
 
+char    *rest_url=NULL;
 
 char    *pid_file=NULL;
 int     wrote_pid_file=FALSE;
@@ -75,7 +82,7 @@ int     allow_severity=LOG_INFO;
 int     deny_severity=LOG_WARNING;
 #endif
 
-
+static int call_rest_url(char *host_name, char *svc_description, int return_code, char *plugin_output);
 
 int main(int argc, char **argv){
         char buffer[MAX_INPUT_BUFFER];
@@ -390,6 +397,9 @@ static int read_config_file(char *filename){
                         strncpy(server_address,varvalue,sizeof(server_address) - 1);
                         server_address[sizeof(server_address)-1]='\0';
                         }
+                else if(!strcmp(varname,"rest_url")){
+                    rest_url=strdup(varvalue);
+                }
 		else if(strstr(input_buffer,"command_file")){
                         if(strlen(varvalue)>sizeof(command_file)-1){
                                 syslog(LOG_ERR,"Command file name is too long in config file '%s' - Line %d\n",filename,line);
@@ -477,7 +487,7 @@ static int read_config_file(char *filename){
                             int checkresult_test_fd=-1;
                             char *checkresult_test=NULL;
                             asprintf(&checkresult_test,"%s/nsca.test.%i",check_result_path,getpid());
-                            checkresult_test_fd=open(checkresult_test,O_WRONLY|O_CREAT);
+                            checkresult_test_fd=open(checkresult_test,O_WRONLY|O_CREAT,S_IRUSR|S_IWUSR);
                             if (checkresult_test_fd>0){
                                     unlink(checkresult_test);
                                     }
@@ -1200,16 +1210,107 @@ static void handle_connection_read(int sock, void *data){
          * only ever write one command at a time into the pipe.
          */
         //syslog(LOG_ERR,"'%s' (%s) []",check_result_path, strlen(check_result_path));
+    if(rest_url != NULL){
+        call_rest_url(host_name,svc_description,return_code,plugin_output);
+    }
+    else{
         if (check_result_path==NULL){
-        write_check_result(host_name,svc_description,return_code,plugin_output,time(NULL));
+            write_check_result(host_name,svc_description,return_code,plugin_output,time(NULL));
         }else{
-                write_checkresult_file(host_name,svc_description,return_code,plugin_output,time(NULL));
+            write_checkresult_file(host_name,svc_description,return_code,plugin_output,time(NULL));
         }
+    }
+
 
 	return;
-        }
+}
+
+/* fetch and return url body via curl */
+CURLcode curl_fetch_url(const char *url,json_object *json) {
+    CURL *ch;
+    struct curl_slist *headers = NULL;
+    CURLcode rcode;
+
+    /* init curl handle */
+    if ((ch = curl_easy_init()) == NULL) {
+        /* log error */
+        syslog(LOG_ERR, "ERROR: Failed to create curl handle in fetch_session");
+        /* return error */
+        return CURLE_FAILED_INIT;
+    }
+
+    /* set content type */
+    headers = curl_slist_append(headers, "Accept: application/json");
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+
+    /* set curl options */
+    curl_easy_setopt(ch, CURLOPT_CUSTOMREQUEST, "POST");
+    curl_easy_setopt(ch, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(ch, CURLOPT_POSTFIELDS, json_object_to_json_string(json));
+
+    /* set url to fetch */
+    curl_easy_setopt(ch, CURLOPT_URL, url);
+
+    /* set default user agent */
+    curl_easy_setopt(ch, CURLOPT_USERAGENT, "libcurl-agent/1.0");
+
+    /* set timeout */
+    curl_easy_setopt(ch, CURLOPT_TIMEOUT, 5);
+
+    /* enable location redirects */
+    curl_easy_setopt(ch, CURLOPT_FOLLOWLOCATION, 1);
+
+    /* set maximum allowed redirects */
+    curl_easy_setopt(ch, CURLOPT_MAXREDIRS, 1);
+
+    /* fetch the url */
+    rcode = curl_easy_perform(ch);
+
+    /* cleanup curl handle */
+    curl_easy_cleanup(ch);
+
+    /* free headers */
+    curl_slist_free_all(headers);
+
+    /* return */
+    return rcode;
+}
 
 
+/* Does a rest call(post) to url */
+static int call_rest_url(char *host_name, char *svc_description, int return_code, char *plugin_output) {
+    json_object *json;
+    /* create json object for post */
+    json = json_object_new_object();
+    /* build post data */
+    if(!strcmp(svc_description,""))
+        json_object_object_add(json,"passiveCheckType", json_object_new_string("PROCESS_HOST_CHECK_RESULT"));
+    else
+        json_object_object_add(json,"passiveCheckType", json_object_new_string("PROCESS_SERVICE_CHECK_RESULT"));
+
+    json_object_object_add(json, "hostName", json_object_new_string(host_name));
+    json_object_object_add(json, "svcDescription", json_object_new_string(svc_description));
+    json_object_object_add(json, "pluginOutput", json_object_new_string(plugin_output));
+    json_object_object_add(json, "returnCode", json_object_new_int(return_code));
+
+    syslog(LOG_ERR,"Json posting %s",json_object_to_json_string(json));
+
+    /* fetch page and capture return code */
+    CURLcode rcode = curl_fetch_url(rest_url,json);
+    /* free json object */
+    json_object_put(json);
+
+    /* check return code */
+    if (rcode != CURLE_OK ) {
+        /* log error */
+        syslog(LOG_ERR,"ERROR: Failed to fetch url (%s) - curl said: %s",
+               rest_url, curl_easy_strerror(rcode));
+        /* return error */
+        return ERROR;
+    }
+
+    return OK;
+}
 
 /* writes service/host check results to the Nagios checkresult directory */
 static int write_checkresult_file(char *host_name, char *svc_description, int return_code, char *plugin_output, time_t check_time){
