@@ -1279,6 +1279,13 @@ CURLcode curl_fetch_url(const char *url,json_object *json) {
 
 /* Does a rest call(post) to url */
 static int call_rest_url(char *host_name, char *svc_description, int return_code, char *plugin_output) {
+    char isoDate8601[64]={0};
+    time_t check_time;
+    time(&check_time);
+    struct tm *ptm;
+    ptm = localtime (&check_time);
+    strftime(isoDate8601,64,"%FT%T.000%z",ptm);
+
     json_object *json;
     /* create json object for post */
     json = json_object_new_object();
@@ -1292,6 +1299,7 @@ static int call_rest_url(char *host_name, char *svc_description, int return_code
     json_object_object_add(json, "svcDescription", json_object_new_string(svc_description));
     json_object_object_add(json, "pluginOutput", json_object_new_string(plugin_output));
     json_object_object_add(json, "returnCode", json_object_new_int(return_code));
+    json_object_object_add(json, "breachTime", json_object_new_string(isoDate8601));
 
     syslog(LOG_ERR,"Json posting %s",json_object_to_json_string(json));
 
