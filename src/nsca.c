@@ -1282,9 +1282,9 @@ static int call_rest_url(char *host_name, char *svc_description, int return_code
     char isoDate8601[64]={0};
     time_t check_time;
     time(&check_time);
-    struct tm *ptm;
-    ptm = localtime (&check_time);
-    strftime(isoDate8601,64,"%FT%T.000%z",ptm);
+    struct tm ptm;
+    localtime_r(&check_time,&ptm);
+    strftime(isoDate8601,64,"%FT%T.000%z",&ptm);
 
     json_object *json;
     /* create json object for post */
