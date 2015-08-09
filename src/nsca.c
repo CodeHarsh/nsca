@@ -21,12 +21,20 @@
 #include "../include/netutils.h"
 #include "../include/utils.h"
 #include "../include/nsca.h"
-
-/* json-c (https://github.com/json-c/json-c) */
 #include <json-c/json.h>
-
-/* libcurl (http://curl.haxx.se/libcurl/c) */
 #include <curl/curl.h>
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+
+#include <event2/bufferevent.h>
+#include <event2/buffer.h>
+#include <event2/listener.h>
+#include <event2/http.h>
+#include <sys/queue.h>
+#include <pthread.h>
 
 
 static int server_port=DEFAULT_SERVER_PORT;
@@ -82,10 +90,233 @@ int     allow_severity=LOG_INFO;
 int     deny_severity=LOG_WARNING;
 #endif
 
+pthread_mutex_t url_queue_lock;
+struct url_queue{
+    json_object *json;
+    TAILQ_ENTRY(url_queue) entries;
+};
+int to_event_queue_size = 0;
+TAILQ_HEAD(, url_queue) to_event_queue_head;
+TAILQ_HEAD(, url_queue) event_queue_head;
+struct event_base *queue_size_event = 0;
+
+static void
+http_request_done(struct evhttp_request *req, void *ctx)
+{
+    char buffer[256];
+    int nread;
+
+    if (req == NULL) {
+        /* If req is NULL, it means an error occurred, but
+         * sadly we are mostly left guessing what the error
+         * might have been.  We'll do our best... */
+        struct bufferevent *bev = (struct bufferevent *) ctx;
+        unsigned long oslerr;
+        int printed_err = 0;
+        int errcode = EVUTIL_SOCKET_ERROR();
+        fprintf(stderr, "some request failed - no idea which one though!\n");
+
+        /* If the OpenSSL error queue was empty, maybe it was a
+         * socket error; let's try printing that. */
+        if (! printed_err)
+            fprintf(stderr, "socket error = %s (%d)\n",
+                    evutil_socket_error_to_string(errcode),
+                    errcode);
+        return;
+    }
+
+    fprintf(stderr, "Response line: %d %s\n",
+            evhttp_request_get_response_code(req),
+            evhttp_request_get_response_code_line(req));
+
+    while ((nread = evbuffer_remove(evhttp_request_get_input_buffer(req),
+                                    buffer, sizeof(buffer)))
+           > 0) {
+        /* These are just arbitrary chunks of 256 bytes.
+         * They are not lines, so we can't treat them as such. */
+        fwrite(buffer, nread, 1, stdout);
+    }
+}
+
+static int
+http_call_event(bufferevent *bev,char *host,char *data,size_t bytes)
+{
+    struct evhttp_request *req;
+    struct evkeyvalq *output_headers;
+    struct evbuffer * output_buffer;
+
+    // Fire off the request
+    req = evhttp_request_new(http_request_done, bev);
+    if (req == NULL) {
+        fprintf(stderr, "evhttp_request_new() failed\n");
+        return 1;
+    }
+
+    output_headers = evhttp_request_get_output_headers(req);
+    evhttp_add_header(output_headers, "Host", host);
+    evhttp_add_header(output_headers, "Connection", "close");
+
+    if (data) {
+        char buf[16]={0};
+
+        output_buffer = evhttp_request_get_output_buffer(req);
+        evbuffer_add(output_buffer, data, bytes);
+
+        evutil_snprintf(buf, sizeof(buf)-1, "%lu", (unsigned long)bytes);
+        evhttp_add_header(output_headers, "Content-Type", "application/json");
+        evhttp_add_header(output_headers, "Content-Length", buf);
+    }
+
+    returnValue = evhttp_make_request(evcon, req, data ? EVHTTP_REQ_POST : EVHTTP_REQ_GET, uri);
+    if (returnValue != 0) {
+        fprintf(stderr, "evhttp_make_request() failed\n");
+        free(data);
+        return 1;
+    }
+    free(data);
+    return 0;
+}
+
+
+static int
+http_call()
+{
+    TAILQ_INIT(&event_queue_head);
+    while(TRUE){
+        while(to_event_queue_size < 5){
+            struct timespec ts;
+            ts.tv_sec = 5;
+            ts.tv_nsec = 0;
+            nanosleep(&ts, NULL);
+        }
+        int returnValue;
+        struct event_base *base;
+        struct evhttp_uri *http_uri;
+        const char *scheme, *host, *path, *query;
+        char uri[256];
+        int port;
+
+        struct bufferevent *bev;
+        struct evhttp_connection *evcon;
+
+    #ifdef _WIN32
+        {
+            WORD wVersionRequested;
+            WSADATA wsaData;
+            int err;
+
+            wVersionRequested = MAKEWORD(2, 2);
+
+            err = WSAStartup(wVersionRequested, &wsaData);
+            if (err != 0) {
+                printf("WSAStartup failed with error: %d\n", err);
+                return 1;
+            }
+        }
+    #endif // _WIN32
+
+        http_uri = evhttp_uri_parse(rest_url);
+        if (http_uri == NULL) {
+            fputs("malformed url",stderr);
+            exit(1);
+        }
+
+        scheme = evhttp_uri_get_scheme(http_uri);
+        if (scheme == NULL || (strcasecmp(scheme, "http") != 0)) {
+            fputs("url must be http",stderr);
+            exit(1);
+        }
+
+        host = evhttp_uri_get_host(http_uri);
+        if (host == NULL) {
+            fputs("url must have a host",stderr);
+            exit(1);
+        }
+
+        port = evhttp_uri_get_port(http_uri);
+        if (port == -1) {
+            port = (strcasecmp(scheme, "http") == 0) ? 80 : 443;
+        }
+
+        path = evhttp_uri_get_path(http_uri);
+        if (path == NULL) {
+            path = "/";
+        }
+
+        query = evhttp_uri_get_query(http_uri);
+        if (query == NULL) {
+            snprintf(uri, sizeof(uri) - 1, "%s", path);
+        } else {
+            snprintf(uri, sizeof(uri) - 1, "%s?%s", path, query);
+        }
+        uri[sizeof(uri) - 1] = '\0';
+
+        // Create event base
+        base = event_base_new();
+        if (!base) {
+            perror("event_base_new()");
+            return 1;
+        }
+
+        bev = bufferevent_socket_new(base, -1, BEV_OPT_CLOSE_ON_FREE);
+
+
+        if (bev == NULL) {
+            fprintf(stderr, "bufferevent_socket_new() failed\n");
+            return 1;
+        }
+
+        // For simplicity, we let DNS resolution block. Everything else should be
+        // asynchronous though.
+        evcon = evhttp_connection_base_bufferevent_new(base, NULL, bev,
+                                                       host, port);
+        if (evcon == NULL) {
+            fprintf(stderr, "evhttp_connection_base_bufferevent_new() failed\n");
+            return 1;
+        }
+
+        if (retries > 0) {
+            evhttp_connection_set_retries(evcon, 3);
+        }
+
+        struct url_queue  *item;
+
+        pthread_mutex_lock(&url_queue_lock);
+        TAILQ_CONCAT(&event_queue_head,&to_event_queue_head,entries);
+        to_event_queue_size=0;
+        pthread_mutex_unlock(&url_queue_lock);
+
+        TAILQ_FOREACH(item, &event_queue_head, entries) {
+            char *data=json_object_to_json_string(item->json);
+            http_call_event(bev,host,strdup(data),strlen(data));
+            json_object_put(item->json);
+        }
+        /* Free the entire tail queue. */
+        while (item = TAILQ_FIRST(&event_queue_head)) {
+            TAILQ_REMOVE(&event_queue_head, item, entries);
+            free(item);
+        }
+
+        event_base_dispatch(base);
+
+        evhttp_connection_free(evcon);
+        event_base_free(base);
+
+    #ifdef _WIN32
+        WSACleanup();
+    #endif
+    }
+
+    return 0;
+}
+
 static int call_rest_url(char *host_name, char *svc_description, int return_code, char *plugin_output);
 
 int main(int argc, char **argv){
-        char buffer[MAX_INPUT_BUFFER];
+    /* Initialize the tail queue. */
+    TAILQ_INIT(&to_event_queue_head);
+    queue_size_event = event_base_new();
+    char buffer[MAX_INPUT_BUFFER];
         int result;
         uid_t uid=-1;
         gid_t gid=-1;
@@ -1225,57 +1456,11 @@ static void handle_connection_read(int sock, void *data){
 	return;
 }
 
-/* fetch and return url body via curl */
-CURLcode curl_fetch_url(const char *url,json_object *json) {
-    CURL *ch;
-    struct curl_slist *headers = NULL;
-    CURLcode rcode;
+static
+void queue_size_event(int fd, short int fo, void* arg)
+{
 
-    /* init curl handle */
-    if ((ch = curl_easy_init()) == NULL) {
-        /* log error */
-        syslog(LOG_ERR, "ERROR: Failed to create curl handle in fetch_session");
-        /* return error */
-        return CURLE_FAILED_INIT;
-    }
-
-    /* set content type */
-    headers = curl_slist_append(headers, "Accept: application/json");
-    headers = curl_slist_append(headers, "Content-Type: application/json");
-
-    /* set curl options */
-    curl_easy_setopt(ch, CURLOPT_CUSTOMREQUEST, "POST");
-    curl_easy_setopt(ch, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(ch, CURLOPT_POSTFIELDS, json_object_to_json_string(json));
-
-    /* set url to fetch */
-    curl_easy_setopt(ch, CURLOPT_URL, url);
-
-    /* set default user agent */
-    curl_easy_setopt(ch, CURLOPT_USERAGENT, "libcurl-agent/1.0");
-
-    /* set timeout */
-    curl_easy_setopt(ch, CURLOPT_TIMEOUT, 5);
-
-    /* enable location redirects */
-    curl_easy_setopt(ch, CURLOPT_FOLLOWLOCATION, 1);
-
-    /* set maximum allowed redirects */
-    curl_easy_setopt(ch, CURLOPT_MAXREDIRS, 1);
-
-    /* fetch the url */
-    rcode = curl_easy_perform(ch);
-
-    /* cleanup curl handle */
-    curl_easy_cleanup(ch);
-
-    /* free headers */
-    curl_slist_free_all(headers);
-
-    /* return */
-    return rcode;
 }
-
 
 /* Does a rest call(post) to url */
 static int call_rest_url(char *host_name, char *svc_description, int return_code, char *plugin_output) {
@@ -1285,6 +1470,7 @@ static int call_rest_url(char *host_name, char *svc_description, int return_code
     struct tm ptm;
     localtime_r(&check_time,&ptm);
     strftime(isoDate8601,64,"%FT%T.000%z",&ptm);
+    struct timeval time_out = {5, 0};
 
     json_object *json;
     /* create json object for post */
@@ -1303,20 +1489,22 @@ static int call_rest_url(char *host_name, char *svc_description, int return_code
 
     syslog(LOG_ERR,"Json posting %s",json_object_to_json_string(json));
 
-    /* fetch page and capture return code */
-    CURLcode rcode = curl_fetch_url(rest_url,json);
-    /* free json object */
-    json_object_put(json);
-
-    /* check return code */
-    if (rcode != CURLE_OK ) {
-        /* log error */
-        syslog(LOG_ERR,"ERROR: Failed to fetch url (%s) - curl said: %s",
-               rest_url, curl_easy_strerror(rcode));
-        /* return error */
+    struct url_queue *item;
+    item = malloc(sizeof(*item));
+    if (item == NULL) {
+        syslog(LOG_ERR,"malloc failed while adding to event queue");
         return ERROR;
     }
+    item->json=json;
 
+    pthread_mutex_lock(&url_queue_lock);
+    TAILQ_INSERT_TAIL(&to_event_queue_head, item, entries);
+    to_event_queue_size++;
+    struct event *ev;
+    //ev = evtimer_new(queue_size_event, queue_size_event, NULL);
+    //evtimer_add(ev, &time_out);
+
+    pthread_mutex_unlock(&url_queue_lock);
     return OK;
 }
 
