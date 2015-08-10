@@ -29,6 +29,7 @@
 #include <string.h>
 #include <errno.h>
 
+#include <evhttp.h>
 #include <event2/bufferevent.h>
 #include <event2/buffer.h>
 #include <event2/listener.h>
@@ -99,10 +100,34 @@ struct url_queue{
 int to_event_queue_size = 0;
 TAILQ_HEAD(, url_queue) to_event_queue_head;
 TAILQ_HEAD(, url_queue) event_queue_head;
-struct event_base *queue_size_event = 0;
 struct timeval time_out = {5, 0};
-struct event *timer;
+struct event timer;
 pthread_t http_thread;
+
+
+int needQuit(pthread_mutex_t *mtx)
+{
+    switch(pthread_mutex_trylock(mtx)) {
+        case 0: /* if we got the lock, unlock and return 1 (true) */
+            pthread_mutex_unlock(mtx);
+            return 1;
+        case EBUSY: /* return 0 (false) if the mutex was locked */
+            return 0;
+    }
+    return 1;
+}
+
+void queue_size_event_callback(int fd, short int fo, void* arg)
+{
+    if(debug==TRUE)
+        syslog(LOG_DEBUG,"Timer ticked with count %d",to_event_queue_size);
+    if(to_event_queue_size > 0){
+        pthread_mutex_lock(&url_queue_lock);
+        to_event_queue_size = 5;
+        pthread_mutex_unlock(&url_queue_lock);
+    }
+    evtimer_add(&timer, &time_out);
+}
 
 static void
 http_request_done(struct evhttp_request *req, void *ctx)
@@ -118,65 +143,60 @@ http_request_done(struct evhttp_request *req, void *ctx)
         unsigned long oslerr;
         int printed_err = 0;
         int errcode = EVUTIL_SOCKET_ERROR();
-        fprintf(stderr, "some request failed - no idea which one though!\n");
+        syslog(LOG_ERR, "some request failed - no idea which one though!\n");
 
         /* If the OpenSSL error queue was empty, maybe it was a
          * socket error; let's try printing that. */
         if (! printed_err)
-            fprintf(stderr, "socket error = %s (%d)\n",
+            syslog(LOG_ERR, "socket error = %s (%d)\n",
                     evutil_socket_error_to_string(errcode),
                     errcode);
         return;
     }
 
-    fprintf(stderr, "Response line: %d %s\n",
+    syslog(LOG_ERR, "Response line: %d %s\n",
             evhttp_request_get_response_code(req),
-            evhttp_request_get_response_code_line(req));
+           req->response_code_line);
 
     while ((nread = evbuffer_remove(evhttp_request_get_input_buffer(req),
                                     buffer, sizeof(buffer)))
            > 0) {
         /* These are just arbitrary chunks of 256 bytes.
          * They are not lines, so we can't treat them as such. */
-        fwrite(buffer, nread, 1, stdout);
+        syslog(LOG_ERR,"Output %s",buffer);
     }
 }
 
 static int
-http_call_event(bufferevent *bev,char *host,char *data,size_t bytes)
+http_call_event(struct event_base *base,struct evhttp_connection *evcon,char *uri,char *host,char *data,size_t bytes)
 {
     struct evhttp_request *req;
-    struct evkeyvalq *output_headers;
     struct evbuffer * output_buffer;
 
     // Fire off the request
-    req = evhttp_request_new(http_request_done, bev);
+    req = evhttp_request_new(http_request_done, base);
     if (req == NULL) {
-        fprintf(stderr, "evhttp_request_new() failed\n");
+        syslog(LOG_ERR, "evhttp_request_new() failed\n");
         return 1;
     }
 
-    output_headers = evhttp_request_get_output_headers(req);
-    evhttp_add_header(output_headers, "Host", host);
-    evhttp_add_header(output_headers, "Connection", "close");
+    evhttp_add_header(req->output_headers, "Host", host);
+    //evhttp_add_header(req->output_headers, "Connection", "close");
+    char buf[16]={0};
+    evbuffer_add(req->output_buffer, data, bytes);
 
-    if (data) {
-        char buf[16]={0};
+    evutil_snprintf(buf, sizeof(buf)-1, "%lu", (unsigned long)bytes);
+    evhttp_add_header(req->output_headers, "Content-Type", "application/json");
+    evhttp_add_header(req->output_headers, "Accept", "application/json");
+    evhttp_add_header(req->output_headers, "Content-Length", buf);
 
-        output_buffer = evhttp_request_get_output_buffer(req);
-        evbuffer_add(output_buffer, data, bytes);
-
-        evutil_snprintf(buf, sizeof(buf)-1, "%lu", (unsigned long)bytes);
-        evhttp_add_header(output_headers, "Content-Type", "application/json");
-        evhttp_add_header(output_headers, "Content-Length", buf);
-    }
-
-    returnValue = evhttp_make_request(evcon, req, data ? EVHTTP_REQ_POST : EVHTTP_REQ_GET, uri);
+    int returnValue = evhttp_make_request(evcon, req, EVHTTP_REQ_POST , uri);
     if (returnValue != 0) {
-        fprintf(stderr, "evhttp_make_request() failed\n");
+        syslog(LOG_ERR, "evhttp_make_request() failed with %d\n",returnValue);
         free(data);
         return 1;
     }
+    evhttp_connection_set_timeout(req->evcon, 5);
     free(data);
     return 0;
 }
@@ -199,8 +219,6 @@ http_call()
         const char *scheme, *host, *path, *query;
         char uri[256];
         int port;
-
-        struct bufferevent *bev;
         struct evhttp_connection *evcon;
 
     #ifdef _WIN32
@@ -221,19 +239,19 @@ http_call()
 
         http_uri = evhttp_uri_parse(rest_url);
         if (http_uri == NULL) {
-            fputs("malformed url",stderr);
+            syslog(LOG_ERR,"malformed url");
             exit(1);
         }
 
         scheme = evhttp_uri_get_scheme(http_uri);
         if (scheme == NULL || (strcasecmp(scheme, "http") != 0)) {
-            fputs("url must be http",stderr);
+            syslog(LOG_ERR,"url must be http");
             exit(1);
         }
 
         host = evhttp_uri_get_host(http_uri);
         if (host == NULL) {
-            fputs("url must have a host",stderr);
+            syslog(LOG_ERR,"url must have a host");
             exit(1);
         }
 
@@ -258,30 +276,28 @@ http_call()
         // Create event base
         base = event_base_new();
         if (!base) {
-            perror("event_base_new()");
+            syslog(LOG_ERR,"event_base_new()");
             return 1;
         }
 
-        bev = bufferevent_socket_new(base, -1, BEV_OPT_CLOSE_ON_FREE);
-
-
-        if (bev == NULL) {
-            fprintf(stderr, "bufferevent_socket_new() failed\n");
-            return 1;
-        }
+        if(debug==TRUE)
+            syslog(LOG_DEBUG,"rest_url : %s\n"
+                    "scheme : %s\n"
+                    "host : %s\n"
+                    "port : %d\n"
+                    "path : %s\n"
+                    "query : %s\n"
+                    "uri : %s\n",rest_url,scheme,host,port,path,query,uri);
 
         // For simplicity, we let DNS resolution block. Everything else should be
         // asynchronous though.
-        evcon = evhttp_connection_base_bufferevent_new(base, NULL, bev,
-                                                       host, port);
+        evcon = evhttp_connection_base_new(base, NULL, host, port);
         if (evcon == NULL) {
-            fprintf(stderr, "evhttp_connection_base_bufferevent_new() failed\n");
+            syslog(LOG_ERR, "evhttp_connection_base_bufferevent_new() failed\n");
             return 1;
         }
 
-        if (retries > 0) {
-            evhttp_connection_set_retries(evcon, 3);
-        }
+        evhttp_connection_set_retries(evcon, 10);
 
         struct url_queue  *item;
 
@@ -292,7 +308,7 @@ http_call()
 
         TAILQ_FOREACH(item, &event_queue_head, entries) {
             char *data=json_object_to_json_string(item->json);
-            http_call_event(bev,host,strdup(data),strlen(data));
+            http_call_event(base,evcon,host,uri,strdup(data),strlen(data));
             json_object_put(item->json);
         }
         /* Free the entire tail queue. */
@@ -314,40 +330,35 @@ http_call()
     return 0;
 }
 
-int needQuit(pthread_mutex_t *mtx)
-{
-    switch(pthread_mutex_trylock(mtx)) {
-        case 0: /* if we got the lock, unlock and return 1 (true) */
-            pthread_mutex_unlock(mtx);
-            return 1;
-        case EBUSY: /* return 0 (false) if the mutex was locked */
-            return 0;
-    }
-    return 1;
-}
-
 static void setup_event_env(){
+    if(debug==TRUE)
+        syslog(LOG_DEBUG,"Setup event environment : Starts\n");
     /* Initialize the tail queue. */
     TAILQ_INIT(&to_event_queue_head);
+
     if (pthread_mutex_init(&url_queue_lock, NULL) != 0)
     {
-        syslog(stderr,"Mutex init failed for url_queue_lock\n");
+        syslog(LOG_ERR,"Mutex init failed for url_queue_lock\n");
         exit(ERROR);
     }
+
     if (pthread_mutex_init(&thread_kill, NULL) != 0)
     {
-        syslog(stderr,"Mutex init failed for thread_kill\n");
+        syslog(LOG_ERR,"Mutex init failed for thread_kill\n");
         exit(ERROR);
     }
     pthread_mutex_lock(&thread_kill);
-    queue_size_event = event_base_new();
-    timer = evtimer_new(queue_size_event, queue_size_event_callback, NULL);
-    evtimer_add(timer, &time_out);
-    int rc = pthread_create(&http_thread, NULL, http_call(), (void *)t);
+    event_init();
+    evtimer_set(&timer, queue_size_event_callback, NULL);
+    evtimer_add(&timer, &time_out);
+    //event_dispatch();
+    int rc = pthread_create(&http_thread, NULL, http_call, NULL);
     if (rc){
-        syslog(stderr,"ERROR; return code from pthread_create() is %d\n", rc);
+        syslog(LOG_ERR,"ERROR; return code from pthread_create() is %d\n", rc);
         exit(ERROR);
     }
+    if(debug==TRUE)
+        syslog(LOG_DEBUG,"Setup event environment : Complete\n");
 }
 
 
@@ -368,16 +379,6 @@ static void event_clean_up(){
     pthread_mutex_unlock(&thread_kill);
     pthread_join(http_thread,NULL);
     pthread_exit(NULL);
-}
-
-void queue_size_event_callback(int fd, short int fo, void* arg)
-{
-    pthread_mutex_lock(&url_queue_lock);
-    if(to_event_queue_size > 0){
-        to_event_queue_size = 5;
-    }
-    pthread_mutex_unlock(&url_queue_lock);
-    evtimer_add(timer, &time_out);
 }
 
 static int call_rest_url(char *host_name, char *svc_description, int return_code, char *plugin_output);
@@ -513,9 +514,6 @@ int main(int argc, char **argv){
 			signal(SIGTERM,sighandler);
 			signal(SIGHUP,sighandler);
 
-            /* setup event environment*/
-            setup_event_env();
-
 			/* close standard file descriptors */
                         close(0);
                         close(1);
@@ -540,6 +538,9 @@ int main(int argc, char **argv){
 			/* drop privileges */
 			if(drop_privileges(nsca_user,uid,gid)==ERROR)
 				do_exit(STATE_CRITICAL);
+
+            /* setup event environment*/
+            setup_event_env();
 
 			do{
 
