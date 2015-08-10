@@ -91,6 +91,7 @@ int     deny_severity=LOG_WARNING;
 #endif
 
 pthread_mutex_t url_queue_lock;
+pthread_mutex_t thread_kill;
 struct url_queue{
     json_object *json;
     TAILQ_ENTRY(url_queue) entries;
@@ -99,6 +100,9 @@ int to_event_queue_size = 0;
 TAILQ_HEAD(, url_queue) to_event_queue_head;
 TAILQ_HEAD(, url_queue) event_queue_head;
 struct event_base *queue_size_event = 0;
+struct timeval time_out = {5, 0};
+struct event *timer;
+pthread_t http_thread;
 
 static void
 http_request_done(struct evhttp_request *req, void *ctx)
@@ -182,7 +186,7 @@ static int
 http_call()
 {
     TAILQ_INIT(&event_queue_head);
-    while(TRUE){
+    while(!needQuit(&thread_kill)){
         while(to_event_queue_size < 5){
             struct timespec ts;
             ts.tv_sec = 5;
@@ -310,12 +314,75 @@ http_call()
     return 0;
 }
 
+int needQuit(pthread_mutex_t *mtx)
+{
+    switch(pthread_mutex_trylock(mtx)) {
+        case 0: /* if we got the lock, unlock and return 1 (true) */
+            pthread_mutex_unlock(mtx);
+            return 1;
+        case EBUSY: /* return 0 (false) if the mutex was locked */
+            return 0;
+    }
+    return 1;
+}
+
+static void setup_event_env(){
+    /* Initialize the tail queue. */
+    TAILQ_INIT(&to_event_queue_head);
+    if (pthread_mutex_init(&url_queue_lock, NULL) != 0)
+    {
+        syslog(stderr,"Mutex init failed for url_queue_lock\n");
+        exit(ERROR);
+    }
+    if (pthread_mutex_init(&thread_kill, NULL) != 0)
+    {
+        syslog(stderr,"Mutex init failed for thread_kill\n");
+        exit(ERROR);
+    }
+    pthread_mutex_lock(&thread_kill);
+    queue_size_event = event_base_new();
+    timer = evtimer_new(queue_size_event, queue_size_event_callback, NULL);
+    evtimer_add(timer, &time_out);
+    int rc = pthread_create(&http_thread, NULL, http_call(), (void *)t);
+    if (rc){
+        syslog(stderr,"ERROR; return code from pthread_create() is %d\n", rc);
+        exit(ERROR);
+    }
+}
+
+
+static void event_clean_up(){
+    struct url_queue  *item;
+
+    /* Free the entire tail queue. */
+    while (item = TAILQ_FIRST(&event_queue_head)) {
+        TAILQ_REMOVE(&event_queue_head, item, entries);
+        free(item);
+    }
+
+    /* Free the entire tail queue. */
+    while (item = TAILQ_FIRST(&to_event_queue_head)) {
+        TAILQ_REMOVE(&to_event_queue_head, item, entries);
+        free(item);
+    }
+    pthread_mutex_unlock(&thread_kill);
+    pthread_join(http_thread,NULL);
+    pthread_exit(NULL);
+}
+
+void queue_size_event_callback(int fd, short int fo, void* arg)
+{
+    pthread_mutex_lock(&url_queue_lock);
+    if(to_event_queue_size > 0){
+        to_event_queue_size = 5;
+    }
+    pthread_mutex_unlock(&url_queue_lock);
+    evtimer_add(timer, &time_out);
+}
+
 static int call_rest_url(char *host_name, char *svc_description, int return_code, char *plugin_output);
 
 int main(int argc, char **argv){
-    /* Initialize the tail queue. */
-    TAILQ_INIT(&to_event_queue_head);
-    queue_size_event = event_base_new();
     char buffer[MAX_INPUT_BUFFER];
         int result;
         uid_t uid=-1;
@@ -446,6 +513,9 @@ int main(int argc, char **argv){
 			signal(SIGTERM,sighandler);
 			signal(SIGHUP,sighandler);
 
+            /* setup event environment*/
+            setup_event_env();
+
 			/* close standard file descriptors */
                         close(0);
                         close(1);
@@ -521,6 +591,7 @@ static void do_cleanup(void){
 
 	/* free memory */
 	free_memory();
+    event_clean_up();
 
         /* close the command file if its still open */
         if(command_file_fp!=NULL)
@@ -1456,12 +1527,6 @@ static void handle_connection_read(int sock, void *data){
 	return;
 }
 
-static
-void queue_size_event(int fd, short int fo, void* arg)
-{
-
-}
-
 /* Does a rest call(post) to url */
 static int call_rest_url(char *host_name, char *svc_description, int return_code, char *plugin_output) {
     char isoDate8601[64]={0};
@@ -1470,7 +1535,7 @@ static int call_rest_url(char *host_name, char *svc_description, int return_code
     struct tm ptm;
     localtime_r(&check_time,&ptm);
     strftime(isoDate8601,64,"%FT%T.000%z",&ptm);
-    struct timeval time_out = {5, 0};
+
 
     json_object *json;
     /* create json object for post */
@@ -1500,10 +1565,6 @@ static int call_rest_url(char *host_name, char *svc_description, int return_code
     pthread_mutex_lock(&url_queue_lock);
     TAILQ_INSERT_TAIL(&to_event_queue_head, item, entries);
     to_event_queue_size++;
-    struct event *ev;
-    //ev = evtimer_new(queue_size_event, queue_size_event, NULL);
-    //evtimer_add(ev, &time_out);
-
     pthread_mutex_unlock(&url_queue_lock);
     return OK;
 }
