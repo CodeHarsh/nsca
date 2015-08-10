@@ -101,8 +101,10 @@ int to_event_queue_size = 0;
 TAILQ_HEAD(, url_queue) to_event_queue_head;
 TAILQ_HEAD(, url_queue) event_queue_head;
 struct timeval time_out = {5, 0};
+struct timespec sleep_time = {5,0};
 struct event timer;
 pthread_t http_thread;
+pthread_t timer_thread;
 
 
 int needQuit(pthread_mutex_t *mtx)
@@ -126,7 +128,18 @@ void queue_size_event_callback(int fd, short int fo, void* arg)
         to_event_queue_size = 5;
         pthread_mutex_unlock(&url_queue_lock);
     }
+    if(!needQuit(&thread_kill)){
+        evtimer_add(&timer, &time_out);
+    }
+
+}
+
+
+void timer_thread_callback(){
+    event_init();
+    evtimer_set(&timer, queue_size_event_callback, NULL);
     evtimer_add(&timer, &time_out);
+    event_dispatch();
 }
 
 static void
@@ -212,10 +225,7 @@ http_call()
     TAILQ_INIT(&event_queue_head);
     while(!needQuit(&thread_kill)){
         while(to_event_queue_size < 5){
-            struct timespec ts;
-            ts.tv_sec = 5;
-            ts.tv_nsec = 0;
-            nanosleep(&ts, NULL);
+            nanosleep(&sleep_time, NULL);
         }
         int returnValue;
         struct event_base *base;
@@ -352,15 +362,19 @@ static void setup_event_env(){
         exit(ERROR);
     }
     pthread_mutex_lock(&thread_kill);
-    event_init();
-    evtimer_set(&timer, queue_size_event_callback, NULL);
-    evtimer_add(&timer, &time_out);
-    //event_dispatch();
+
     int rc = pthread_create(&http_thread, NULL, http_call, NULL);
     if (rc){
-        syslog(LOG_ERR,"ERROR; return code from pthread_create() is %d\n", rc);
+        syslog(LOG_ERR,"ERROR; return code from http_thread pthread_create() is %d\n", rc);
         exit(ERROR);
     }
+
+    rc = pthread_create(&timer_thread, NULL, timer_thread_callback, NULL);
+    if (rc){
+        syslog(LOG_ERR,"ERROR; return code from timer_thread_callback pthread_create() is %d\n", rc);
+        exit(ERROR);
+    }
+
     if(debug==TRUE)
         syslog(LOG_DEBUG,"Setup event environment : Complete\n");
 }
@@ -382,6 +396,7 @@ static void event_clean_up(){
     }
     pthread_mutex_unlock(&thread_kill);
     pthread_join(http_thread,NULL);
+    pthread_join(timer_thread,NULL);
     pthread_exit(NULL);
 }
 
