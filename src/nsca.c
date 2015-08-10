@@ -180,10 +180,14 @@ http_call_event(struct event_base *base,struct evhttp_connection *evcon,char *ur
         return 1;
     }
 
+
     evhttp_add_header(req->output_headers, "Host", host);
-    //evhttp_add_header(req->output_headers, "Connection", "close");
+    evhttp_add_header(req->output_headers, "Connection", "close");
     char buf[16]={0};
     evbuffer_add(req->output_buffer, data, bytes);
+    syslog(LOG_ERR,"Host : %s\n",host);
+    syslog(LOG_ERR,"URI : %s\n",uri);
+    syslog(LOG_ERR,"Json posting %d %s\n",bytes,data);
 
     evutil_snprintf(buf, sizeof(buf)-1, "%lu", (unsigned long)bytes);
     evhttp_add_header(req->output_headers, "Content-Type", "application/json");
@@ -308,7 +312,7 @@ http_call()
 
         TAILQ_FOREACH(item, &event_queue_head, entries) {
             char *data=json_object_to_json_string(item->json);
-            http_call_event(base,evcon,host,uri,strdup(data),strlen(data));
+            http_call_event(base,evcon,uri,host,strdup(data),strlen(data));
             json_object_put(item->json);
         }
         /* Free the entire tail queue. */
