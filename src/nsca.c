@@ -209,7 +209,6 @@ http_call_event(struct event_base *base,struct evhttp_connection *evcon,char *ur
     evhttp_add_header(req->output_headers, "Content-Type", "application/json");
     evhttp_add_header(req->output_headers, "Accept", "application/json");
     evhttp_add_header(req->output_headers, "Content-Length", buf);
-    evhttp_connection_set_timeout(req->evcon, 5);
 
     int returnValue = evhttp_make_request(evcon, req, EVHTTP_REQ_POST , uri);
     if (returnValue != 0) {
@@ -217,6 +216,7 @@ http_call_event(struct event_base *base,struct evhttp_connection *evcon,char *ur
         free(data);
         return 1;
     }
+    evhttp_connection_set_timeout(req->evcon, MAX_TIMEOUT_SEC);
 
     free(data);
     return 0;
@@ -301,7 +301,6 @@ http_call()
 
         evhttp_connection_set_retries(evcon, MAX_RETRIES);
         evhttp_connection_set_timeout(evcon, MAX_TIMEOUT_SEC);
-
         struct url_queue  *item;
 
         pthread_mutex_lock(&url_queue_lock);

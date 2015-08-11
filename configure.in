@@ -259,6 +259,36 @@ CFLAGS="$CFLAGS `pkg-config --cflags libevent`"
 LDFLAGS="$LDFLAGS `pkg-config --libs libevent`"
 
 
+#check pthread
+dnl =================================
+dnl = checking pthread library
+dnl =================================
+# multithreading via pthreads
+AC_CHECK_HEADERS(
+    [pthread.h],
+     [
+       AC_CHECK_LIB(
+         [pthread],
+          [pthread_create],
+          [
+             AC_DEFINE([USE_PTHREADS], [1], [Multithreading support enabled.])
+             PTHREADS_LIBS="-lpthread"
+       case "${os_type}" in
+       solaris) PTHREADS_CFLAGS="-pthreads" ;;
+       *)       PTHREADS_CFLAGS="-pthread" ;;
+       esac
+             AC_SUBST(PTHREADS_LIBS)
+             AC_SUBST(PTHREADS_CFLAGS)
+           ],
+           [AC_MSG_FAILURE([pthread is missing])],
+           [-lpthread]
+         )
+       ],
+       [AC_MSG_FAILURE([pthread is missing])]
+ )
+CFLAGS="$CFLAGS $PTHREADS_CFLAGS"
+LDFLAGS="$LDFLAGS $PTHREADS_LIBS"
+
 AC_ARG_WITH(log_facility,--with-log-facility=<facility> sets NSCA syslog facility,log_facility=$withval,log_facility=daemon)
 AC_SUBST(log_facility)
 AC_DEFINE_UNQUOTED(NSCA_LOG_FACILITY,["$log_facility"],[NSCA syslog facility])
