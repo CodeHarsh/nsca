@@ -247,8 +247,16 @@ AC_CHECK_HEADERS([json-c/json.h], , AC_MSG_ERROR([missing json.h header]))
 CFLAGS="$CFLAGS `pkg-config --cflags json-c`"
 LDFLAGS="$LDFLAGS `pkg-config --libs json-c`"
 
-#CFLAGS="$CFLAGS $(pkg-config --cflags json-c) $(pkg-config --cflags json) $(pkg-config --cflags libcurl)"
-#LDFLAGS="$LDFLAGS $(pkg-config --libs json-c) $(pkg-config --libs json) $(pkg-config --libs libcurl)"
+# check libevent
+dnl =================================
+dnl = checking libevent library
+dnl =================================
+AC_CHECK_LIB(event, event_base_new,,
+	AC_MSG_ERROR([Cannot find required library: libevent]))
+
+AC_CHECK_HEADERS([event2/http.h], , AC_MSG_ERROR([missing http.h header]))
+CFLAGS="$CFLAGS `pkg-config --cflags libevent`"
+LDFLAGS="$LDFLAGS `pkg-config --libs libevent`"
 
 
 AC_ARG_WITH(log_facility,--with-log-facility=<facility> sets NSCA syslog facility,log_facility=$withval,log_facility=daemon)

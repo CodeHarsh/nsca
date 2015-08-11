@@ -38,6 +38,9 @@
 #include <pthread.h>
 
 
+#define BATCH_SIZE 5
+#define MAX_RETRIES 3
+#define MAX_TIMEOUT_SEC 5
 static int server_port=DEFAULT_SERVER_PORT;
 static char server_address[16]="0.0.0.0";
 static int socket_timeout=DEFAULT_SOCKET_TIMEOUT;
@@ -125,7 +128,7 @@ void queue_size_event_callback(int fd, short int fo, void* arg)
         syslog(LOG_DEBUG,"Timer ticked with count %d",to_event_queue_size);
     if(to_event_queue_size > 0){
         pthread_mutex_lock(&url_queue_lock);
-        to_event_queue_size = 5;
+        to_event_queue_size = BATCH_SIZE;
         pthread_mutex_unlock(&url_queue_lock);
     }
     if(!needQuit(&thread_kill)){
@@ -206,6 +209,7 @@ http_call_event(struct event_base *base,struct evhttp_connection *evcon,char *ur
     evhttp_add_header(req->output_headers, "Content-Type", "application/json");
     evhttp_add_header(req->output_headers, "Accept", "application/json");
     evhttp_add_header(req->output_headers, "Content-Length", buf);
+    evhttp_connection_set_timeout(req->evcon, 5);
 
     int returnValue = evhttp_make_request(evcon, req, EVHTTP_REQ_POST , uri);
     if (returnValue != 0) {
@@ -213,7 +217,7 @@ http_call_event(struct event_base *base,struct evhttp_connection *evcon,char *ur
         free(data);
         return 1;
     }
-    evhttp_connection_set_timeout(req->evcon, 5);
+
     free(data);
     return 0;
 }
@@ -224,7 +228,7 @@ http_call()
 {
     TAILQ_INIT(&event_queue_head);
     while(!needQuit(&thread_kill)){
-        while(to_event_queue_size < 5){
+        while(to_event_queue_size < BATCH_SIZE && (!needQuit(&thread_kill)) ){
             nanosleep(&sleep_time, NULL);
         }
         int returnValue;
@@ -234,22 +238,6 @@ http_call()
         char uri[256];
         int port;
         struct evhttp_connection *evcon;
-
-    #ifdef _WIN32
-        {
-            WORD wVersionRequested;
-            WSADATA wsaData;
-            int err;
-
-            wVersionRequested = MAKEWORD(2, 2);
-
-            err = WSAStartup(wVersionRequested, &wsaData);
-            if (err != 0) {
-                printf("WSAStartup failed with error: %d\n", err);
-                return 1;
-            }
-        }
-    #endif // _WIN32
 
         http_uri = evhttp_uri_parse(rest_url);
         if (http_uri == NULL) {
@@ -311,7 +299,8 @@ http_call()
             return 1;
         }
 
-        evhttp_connection_set_retries(evcon, 10);
+        evhttp_connection_set_retries(evcon, MAX_RETRIES);
+        evhttp_connection_set_timeout(evcon, MAX_TIMEOUT_SEC);
 
         struct url_queue  *item;
 
@@ -336,9 +325,6 @@ http_call()
         evhttp_connection_free(evcon);
         event_base_free(base);
 
-    #ifdef _WIN32
-        WSACleanup();
-    #endif
     }
 
     return 0;
